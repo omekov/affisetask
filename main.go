@@ -7,25 +7,35 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
-var (
-	errOnlyMethodsPOSTAndOPTIONS = errors.New("Sorry, only POST and OPTIONS methods are supported")
-	errLimitedURLs               = errors.New("limited urls")
+const (
+	timeout          = time.Second
+	maxConnectionIn  = 10
+	maxConnectionOut = 4
 )
+
+var atmvar int32
+
+type result struct {
+	URL            string `json:"url"`
+	ResponseStatus string `json:"responseStatus"`
+}
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	httpServer := &http.Server{
 		Addr:        ":8080",
-		Handler:     Router(),
+		Handler:     Mux(),
 		BaseContext: func(_ net.Listener) context.Context { return ctx },
 	}
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	go func() {
 		if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatalf("HTTP server ListenAndServe: %v", err)
@@ -35,9 +45,9 @@ func main() {
 
 	signal.Notify(
 		signalChan,
-		syscall.SIGHUP,  // kill -SIGHUP XXXX
-		syscall.SIGINT,  // kill -SIGINT XXXX or Ctrl+c
-		syscall.SIGQUIT, // kill -SIGQUIT XXXX
+		syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGQUIT,
 	)
 
 	<-signalChan
@@ -64,70 +74,83 @@ func main() {
 	return
 }
 
-// Router ...
-func Router() *http.ServeMux {
+// Mux ...
+func Mux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", handlerURL)
+	mux.Handle("/", limitConnections(urlHandler()))
 	return mux
 }
 
-func handlerURL(w http.ResponseWriter, r *http.Request) {
-	var urls []string
-	w.Header().Set("Access-Control-Allow-Headers", "*")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "*")
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Accept", "application/json")
-	switch r.Method {
-	case http.MethodOptions:
-	case http.MethodPost:
-	default:
-		http.Error(w, errOnlyMethodsPOSTAndOPTIONS.Error(), http.StatusMethodNotAllowed)
-		return
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&urls); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if len(urls) > 20 {
-		http.Error(w, errLimitedURLs.Error(), http.StatusBadRequest)
-		return
-	}
-	for _, uri := range urls {
-		u, err := url.Parse(uri)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+func limitConnections(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if atmvar > maxConnectionIn {
+			http.Error(rw, errors.New(http.StatusText(http.StatusTooManyRequests)).Error(), http.StatusTooManyRequests)
 			return
 		}
-		if err := urlRequest(*u); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
+		atomic.AddInt32(&atmvar, 1)
+		next.ServeHTTP(rw, r)
+		atomic.AddInt32(&atmvar, -1)
+	})
 }
 
-func urlRequest(u url.URL) error {
-	transport := &http.Transport{
-		MaxConnsPerHost: 100,
-		MaxIdleConns:    4,
-	}
+func urlHandler() http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		if r.Method != http.MethodPost {
+			http.Error(rw, errors.New(http.StatusText(http.StatusMethodNotAllowed)).Error(), http.StatusMethodNotAllowed)
+			return
+		}
+		var urls []string
+		if err := json.NewDecoder(r.Body).Decode(&urls); err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(urls) > 20 {
+			http.Error(rw, errors.New("only 20 urls").Error(), http.StatusBadRequest)
+			return
+		}
+		results, err := request(ctx, urls)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		byteResult, err := json.Marshal(results)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
+		}
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(http.StatusOK)
+		rw.Write(byteResult)
+		return
+	})
+}
+
+func request(ctx context.Context, urls []string) ([]result, error) {
 	client := http.Client{
-		Timeout:   1 * time.Second,
-		Transport: transport,
+		Timeout: timeout,
+		Transport: &http.Transport{
+			MaxIdleConns:        maxConnectionIn,
+			MaxIdleConnsPerHost: maxConnectionIn,
+		},
 	}
-	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
-	if err != nil {
-		return err
+	results := make([]result, 0)
+	for _, u := range urls {
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		results = append(results, result{
+			URL:            u,
+			ResponseStatus: resp.Status,
+		})
 	}
-	res, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	log.Printf("resposne %v", res)
-	if res.StatusCode != http.StatusOK {
-		return errors.New("is not status code 200")
-	}
-	return nil
+	ctx.Done()
+	return results, nil
 }
